@@ -1,0 +1,394 @@
+<html>
+<head>
+<title>Novatek mp4 GPS Player</title>
+<style>
+  .thumb {
+    height: 75px;
+    border: 1px solid #000;
+    margin: 10px 5px 0 0;
+  }
+  #map {
+    height: 250px;
+    width: 250px;
+  }
+</style>
+<script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBSpLfJzkz8zqChq1GdopSmFu_-jF4Xo6c&callback=initMap" async defer></script>
+<script type="javascript/worker" id="processFileSync">
+  function freadAsArrayBufferSync(file,offset,length) {
+      var slice = file.slice(offset, offset + length);
+      var result = new FileReaderSync().readAsArrayBuffer(slice);
+//      console.log(typeof result + ": " + result + "\n");
+      return result;
+  }
+  
+  function freadAsUint32Sync(file,offset) {
+      var slice = file.slice(offset, offset + 4);
+      var result = new FileReaderSync().readAsArrayBuffer(slice);
+      var dataview=new DataView(result);
+      var value=dataview.getUint32(0);
+//      console.log(typeof result + ": " + result + "\n");
+      return value;
+  }
+  
+  function freadAsTextSync(file,offset,length) {
+      var slice = file.slice(offset, offset + length);
+      var result = new FileReaderSync().readAsText(slice);
+//      console.log(typeof result + ": " + result + "\n");
+      return result;
+  }
+  
+  function get_atom_info_sync(file,offset) {
+      var atom_size = freadAsUint32Sync(file,offset);
+      var atom_type = freadAsTextSync(file,offset+4,4);
+//      console.log("offset:" + offset + " atom_size:" + atom_size + " atom_type:" + atom_type + "\n")
+      return [ atom_size, atom_type ];
+  }
+  
+  function get_gps_atom_info_sync(file, offset) {
+      var gps_atom_pos = freadAsUint32Sync(file,offset);
+      var gps_atom_size = freadAsUint32Sync(file,offset+4,4);
+//      console.log("offset:" + offset + " gps_atom_pos:" + gps_atom_pos + " gps_atom_size:" + gps_atom_size + "\n")
+      return [ gps_atom_pos, gps_atom_size ];
+  }
+  
+  function fix_time(hour,minute,second,year,month,day) {
+    return [(year+2000),"-",('00'+month).slice( -2 ),"-",('00'+day).slice( -2 ),
+    "T",('00'+hour).slice( -2 ),":",('00'+minute).slice( -2 ),":",('00'+second).slice( -2 ),
+    "Z"].join('');
+  }
+
+  function fix_coordinates(hemisphere,coordinate) {
+    // Novatek stores coordinates in odd DDDmm.mmmm format
+    var minutes = coordinate % 100.0;
+    var degrees = coordinate - minutes;
+    var f_coordinate = degrees / 100.0 + (minutes / 60.0);
+    if (hemisphere == 'S' || hemisphere == 'W') {
+        return -1*f_coordinate;
+    } else {
+        return f_coordinate;
+    }
+  }
+
+  function fix_speed(speed) {
+    // 1 knot = 0.514444 m/s
+    return speed * 0.514444;
+  }
+  
+  function get_gps_atom_sync(file,atom_pos,atom_size) {
+    var expected_type='free';
+    var expected_magic='GPS ';
+    var atom_size1=freadAsUint32Sync(file,atom_pos);
+    var atom_type=freadAsTextSync(file,atom_pos+4,4);
+    var magic=freadAsTextSync(file,atom_pos+8,4);
+    
+    if (atom_size != atom_size1 || atom_type != expected_type || magic != expected_magic) {
+      console.log("Error! skipping atom at " + atom_pos
+        + " (expected size:" + atom_size
+        + ", actual size:" + atom_size1
+        + ", expected type:" + expected_type
+        + ", actual type:" + atom_type
+        + ", expected magic:" + expected_magic
+        + ", actual maigc:"+ magic
+        + ")!");
+      return [null,null,null,null];
+    }
+    
+    var latitude=0;
+    var longitude=0;
+    var time=0;
+    var speed=0;
+
+    var data=freadAsArrayBufferSync(file,atom_pos,atom_size);
+    var dataview=new DataView(data);
+
+    // checking for weird Azdome 0xAA XOR "encrypted" GPS data. This portion is a quick fix.
+    console.log("data[12]:" + dataview.getUint8(12));
+    if (dataview.getUint8(12) == 0x05) {
+        if (atom_size < 254) {
+            var payload_size = atom_size;
+        } else {
+            var payload_size = 254;
+        }
+        var ui8=new Uint8Array(data.slice(18,18+payload_size));
+        var xor = ui8.map(function(n) {return n ^ 0xAA;});
+        var payload=String.fromCharCode.apply("", xor);
+
+        var year = payload.substr(8,4); // [8:12]
+        var month = payload.substr(12,2); // [12:14]);
+        var day = payload.substr(14,2); // [14:16]);
+        var hour = payload.substr(16,2); // [16:18]);
+        var minute = payload.substr(18,2); // [18:20]);
+        var second = payload.substr(20,2); // [20:22]);
+        
+        var latitude_b = payload.substr(38,1); // [38]
+        var latitude = payload.substr(39,8); // [39:47]
+        var longitude_b = payload.substr(47,1); // [47]
+        var longitude = payload.substr(48,8); // [48:56]
+        var speed = payload.substr(57,8); // [57:65]
+
+        console.log([
+          "year:",year,
+          " month:",month,
+          " day:",day,
+          " hour:", hour,
+          " minute:",minute,
+          " second:",second,
+          " latitude_b:",latitude_b,
+          " longitude_b:",longitude_b,
+          " latitude:",latitude,
+          " longitude:",longitude,
+          " speed:",speed        
+        ].join(''));
+
+        var tim = new Date( parseInt(year), parseInt(month), parseInt(day), parseInt(hour), parseInt(minute), parseInt(second) )/1000.0 ;
+        var lat = fix_coordinates(latitude_b,parseFloat(latitude)/10000);
+        var lon = fix_coordinates(longitude_b,parseFloat(longitude)/1000);
+        //speed is not as accurate as it could be, only -1/+0 km/h accurate.
+        var spe = parseFloat(speed);// /3.6;
+        
+        return [lat,lon,tim,spe];
+        
+    } else {
+        var hour=dataview.getUint32(48+0,true);
+        var minute=dataview.getUint32(48+4,true);
+        var second=dataview.getUint32(48+8,true);
+        var year=dataview.getUint32(48+12,true);
+        var month=dataview.getUint32(48+16,true);
+        var day=dataview.getUint32(48+20,true);        
+        var active=String.fromCharCode(dataview.getUint8(48+24));
+        var latitude_b=String.fromCharCode(dataview.getUint8(48+25));
+        var longitude_b=String.fromCharCode(dataview.getUint8(48+26));
+        var unknown2=dataview.getUint8(48+27);
+        var latitude=dataview.getFloat32(48+28,true);
+        var longitude=dataview.getFloat32(48+32,true);
+        var speed=dataview.getFloat32(48+36,true);
+
+        console.log([
+          "hour:", hour,
+          " minute:",minute,
+          " second:",second,
+          " year:",year,
+          " month:",month,
+          " day:",day,
+          " active:",active,
+          " latitude_b:",latitude_b,
+          " longitude_b:",longitude_b,
+          " unknown2:",unknown2,
+          " latitude:",latitude,
+          " longitude:",longitude,
+          " speed:",speed        
+        ].join(''));
+                
+        var tim = new Date( 2000+year, month, day, hour, minute, second )/1000.0 ;
+        var lat = fix_coordinates(latitude_b,latitude);
+        var lon = fix_coordinates(longitude_b,longitude);
+        var spe = speed; // fix_speed(speed);
+
+        //it seems that A indicate reception
+        if (active != 'A') {
+          console.log("Skipping: lost GPS satelite reception. Time: " + time);
+          return [null,null,tim,null];
+        }
+        return [lat,lon,tim,spe];
+    }
+  }
+  onmessage = function(e) {
+    var file=e.data;
+    var offset=0;
+    var gps_data=[];
+    while (offset<=file.size-8) {
+      var [atom_size, atom_type] = get_atom_info_sync(file,offset);
+      if (atom_size === 0) { break; }
+      if (atom_type === "moov") { 
+        console.log("Found moov atom... offset:" + offset + " atom_size:" + atom_size + " atom_type:" + atom_type);
+        var sub_offset = offset+8;
+        while (sub_offset < offset + atom_size) {
+          var [sub_atom_size, sub_atom_type] = get_atom_info_sync(file, sub_offset);
+          if (sub_atom_type === "gps ") {
+            console.log("Found gps chunk descriptor atom... sub_offset:" + sub_offset + " sub_atom_size:" + sub_atom_size + " sub_atom_type:" + sub_atom_type);
+            var gps_offset = 16 + sub_offset; // +16 = skip headers
+            while (gps_offset < sub_offset + sub_atom_size) {
+              var [ gps_atom_pos,gps_atom_size ] = get_gps_atom_info_sync(file,gps_offset);
+              console.log("gps_offset:" + gps_offset + " gps_atom_pos:" + gps_atom_pos + " gps_atom_size:" + gps_atom_size);
+              var [latitude,longitude,time,speed]=get_gps_atom_sync(file,gps_atom_pos,gps_atom_size);
+              console.log("latitude:"+latitude+" longitude:"+longitude+" time:"+time+" speed:"+speed);
+//              gps_data.push([latitude,longitude,time,speed]);
+              var gps={};
+              gps["latitude"]=latitude; gps["longitude"]=longitude; gps["time"]=time; gps["speed"]=speed;
+              gps_data.push(gps);
+              gps_offset += 8;
+            }
+          }
+          sub_offset += sub_atom_size;
+        }
+      }
+      offset+=atom_size;
+    }
+//    postMessage(gps_data);
+    var sorted=gps_data.sort(function(a,b){return a.time-b.time;})
+    postMessage(sorted);
+  };
+</script>
+<script>  
+  function process_file_sync(file){
+    var blob = new Blob([document.querySelector('#processFileSync').textContent]);
+    var blobURL = window.URL.createObjectURL(blob);
+    var worker = new Worker(blobURL);
+    worker.onmessage = function(e) {
+      var videoSources=document.querySelectorAll("source[title=\""+file.name+"\"]");
+      videoSources.forEach(function(videoSource) {
+        videoSource.setAttribute("data-gps",JSON.stringify(e.data));
+      });
+      console.log(JSON.stringify(e.data));
+      
+      var path=[];
+      e.data.forEach(function( gps ) {
+        if ( gps.latitude == null || gps.longitude == null ) {
+          if (path.length>1) {
+            var line = new google.maps.Polyline({path: path,map: map});
+            path=[];
+          }      
+          return;
+        }
+        var pos={}; pos["lat"]=gps.latitude; pos["lng"]=gps.longitude;
+        path.push(pos);
+      });
+      
+      if (path.length>1) {
+        var line = new google.maps.Polyline({path: path,map: map});
+      }      
+    };
+    worker.postMessage(file); // Start the worker.
+  }
+
+  function handleFileSelect(evt) {
+    var files = evt.target.files; // FileList object
+
+    // Loop through the FileList and render image files as thumbnails.
+    for (var i = 0, f; f = files[i]; i++) {
+
+      if (f.type.match('image.*')) {
+          // Render thumbnail.
+          var span = document.createElement('span');
+          
+          span.innerHTML = ['<img class="thumb" src="', URL.createObjectURL(f),
+                            '" title="', escape(f.name), '"/>'].join('');
+          span.children[0].addEventListener('click', function() {
+            var main=document.getElementById('main');
+            main.innerHTML = ['<img width="100%" src="', this.getAttribute('src'),
+                            '" title="', this.getAttribute('title'), '"/>'].join('');
+          }, false);
+
+          document.getElementById('list').insertBefore(span, null);
+      }
+      else if (f.type.match('video.*')) {
+
+          var span = document.createElement('span');
+          span.innerHTML = ['<video class="thumb" no-controls><source src="', URL.createObjectURL(f),
+                            '" title="', escape(f.name), '"/></video>'].join('');
+          span.children[0].addEventListener('click', function() {
+            var main=document.getElementById('main');
+            main.innerHTML = ['<video width="100%" controls autoplay><source src="', this.children[0].getAttribute('src'),
+                            '" title="', this.children[0].getAttribute('title'),
+                            '" data-gps="', this.children[0].getAttribute('data-gps'), '"/></video>'].join('');
+            main.children[0].children[0].setAttribute("data-gps",this.children[0].getAttribute('data-gps'));
+            main.children[0].addEventListener('resize',function(e){
+              console.log("resize: offsetHeight:" + e.target.offsetHeight);
+              document.getElementById('map').style.height=e.target.offsetHeight;
+            },false);
+            main.children[0].addEventListener('timeupdate',function(e){
+//              console.log("timeupdate: " + e.target.currentTime);
+              var currentTime=e.target.currentTime;
+              var gps=JSON.parse(e.target.children[0].getAttribute("data-gps"));
+              if (Object.prototype.toString.call(gps) === '[object Array]' && gps.length>1) {
+                var stime=gps[0].time;
+                for (var i=0;i<gps.length;i++){
+                  if(gps[i].time-stime >= Math.round(currentTime)) {
+                    console.log("stime:" + stime + " currentTime:" + currentTime +
+                    " gps[" + i + "].time-stime:" + (gps[i].time-stime) +
+                    " " + JSON.stringify(gps[i]));
+                    document.getElementById('message').innerHTML=[
+                    " [" + i + "] time: " , new Date(gps[i].time*1000).toISOString().substr(0,19).replace("T", " "),
+                    " speed: " , Math.round(gps[i].speed*1000)/1000 ].join("");
+                    
+                    if ( gps[i].latitude == null || gps[i].longitude == null ) {
+                      document.getElementById('message').innerHTML="";
+                      break;
+                    }
+                    var cen=new google.maps.LatLng( gps[i].latitude, gps[i].longitude );
+                    map.setCenter( cen ) ;
+                    centerMarker.setPosition(cen);
+                    break;
+                  }
+                }
+              }              
+            },false);
+            main.children[0].addEventListener('ended',function(e){
+              var title=e.target.children[0].title;
+              console.log("ended: title:" + title);
+              var list=document.getElementById('list');
+              for (var i=0;i<list.children.length-1;i++){ // -1 to skip last video;
+                var sp=list.children[i];
+                if (sp.children[0].children[0].title == title) {
+                  var event = new MouseEvent('click', {view: window,bubbles: true,cancelable: true});
+                  list.children[i+1].children[0].dispatchEvent(event);
+                }
+              }
+            },false);
+            main.children[0].play();
+          }, false);
+                                  
+          document.getElementById('list').insertBefore(span, null);
+          
+          // Web Worker to extract GPS data from the file
+          process_file_sync(f);
+          
+          if (i===0) { // open the first file
+            var event = new MouseEvent('click', {view: window,bubbles: true,cancelable: true});
+            span.children[0].dispatchEvent(event);
+          }
+     }
+      else {
+        continue;
+      }
+    }
+  }
+  var map;
+  var centerMarker;
+  function initMap() {
+    map = new google.maps.Map(document.getElementById('map'), {
+      center: {lat: 35.70861002604167, lng: 139.61922200520834},
+      zoom: 15
+    });
+    centerMarker = new google.maps.Marker({
+      position: map.getCenter(),
+      icon: { path: google.maps.SymbolPath.CIRCLE, scale: 5 },
+      draggable: false,
+      map: map
+    });
+  }
+  window.onload = function() {
+    document.getElementById('files').addEventListener('change', handleFileSelect, false);
+
+    var offsetHeight=document.getElementById('main').offsetHeight;
+    console.log("load: offsetHeight:" + offsetHeight);
+    document.getElementById('map').style.height=offsetHeight;
+
+    window.addEventListener('resize',function(e){
+      var offsetHeight=document.getElementById('main').offsetHeight;
+      console.log("resize: offsetHeight:" + offsetHeight);
+      document.getElementById('map').style.height=offsetHeight;
+    },false);
+  };
+</script>
+</head>
+<body>
+<div>Ref: Sergei's <a href="https://sergei.nz/extracting-gps-data-from-viofo-a119-and-other-novatek-powered-cameras/">Extracting GPS data from Viofo A119 and other Novatek powered cameras</a></div>
+<div id="main" style="float:left; width:calc(100% - 250px); "><video width="100%"/></div>
+<div style="float:left; width:auto;height:auto;"><div id="map"></div></div>
+<div style="clear:both;">
+<input type="file" id="files" name="files[]" multiple /><output id="message"></output>
+</div>
+<div><output id="list"></output></div></div>
+</body>
+</html>
