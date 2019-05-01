@@ -6,3 +6,6 @@ Reference: Sergei's <a href="https://sergei.nz/extracting-gps-data-from-viofo-a1
 Note: I couldn't test Azdom format.
 
 Tags: Novatek mp4 GPS, Web Socket, extract GPS data, Google Map API
+
+Preview(htmlpreview.github.io)
+http://htmlpreview.github.io/?https://raw.githubusercontent.com/hiskang/MP4GPSPlayer/master/mp4gps.html
